@@ -1,0 +1,14 @@
+target/
+
+output/
+
+.cache/
+**/.cache/
+
+docs/superpowers/
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
