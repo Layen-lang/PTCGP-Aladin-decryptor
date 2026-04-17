@@ -67,7 +67,14 @@ fn worker_thread(
             )));
 
             // Always re-pull DefaultMasterData and index (small, may change each update)
-            refresh_support_dirs(&serial, &cache_base, &tx);
+            if let Err(e) = refresh_support_dirs(&serial, &cache_base, &tx) {
+                let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(e)));
+                let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Done {
+                    decrypted: 0,
+                    errors: 1,
+                }));
+                return;
+            }
 
             // New blobs
             let remote_stems = match list_remote_blob_stems(&serial) {
@@ -109,7 +116,7 @@ fn worker_thread(
                         "Sharin.Resources/Default/blob/{}/{}.aladin",
                         prefix, stem
                     ));
-                    if let Err(e) = pull_file(&serial, &remote, &local) {
+                    if let Err(e) = pull_file(&serial, &remote, &local, &|_| {}) {
                         let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(
                             format!("[!] Pull {stem}: {e}"),
                         )));
@@ -132,8 +139,12 @@ fn worker_thread(
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let serial_clone = serial.clone();
             let pull_dir_clone = pull_dir.clone();
+            let tx_log = tx.clone();
             std::thread::spawn(move || {
-                let res = aladin_core::adb::pull_directory(&serial_clone, REMOTE_BASE, &pull_dir_clone);
+                let log = |s: String| {
+                    let _ = tx_log.send(WorkerMsg::PipelineEvent(PipelineEvent::Log(s)));
+                };
+                let res = aladin_core::adb::pull_directory(&serial_clone, REMOTE_BASE, &pull_dir_clone, &log);
                 let _ = done_tx.send(res);
             });
 
@@ -205,23 +216,22 @@ fn worker_thread(
 
 /// Re-pulls DefaultMasterData and the full index from the device.
 /// These directories are small and change with every game update.
-fn refresh_support_dirs(serial: &str, cache_base: &Path, tx: &Sender<WorkerMsg>) {
-    // DefaultMasterData → cache_base/DefaultMasterData/
-    let remote_master = format!("{}/DefaultMasterData", REMOTE_BASE);
-    if let Err(e) = pull_directory(serial, &remote_master, cache_base) {
-        let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(
-            format!("[!] Pull DefaultMasterData: {e}"),
-        )));
-    }
+/// Returns an error string on the first failure.
+fn refresh_support_dirs(serial: &str, cache_base: &Path, tx: &Sender<WorkerMsg>) -> Result<(), String> {
+    let log = |s: String| {
+        let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Log(s)));
+    };
 
-    // Sharin.Resources/Default/index → cache_base/Sharin.Resources/Default/index/
+    let remote_master = format!("{}/DefaultMasterData", REMOTE_BASE);
+    pull_directory(serial, &remote_master, cache_base, &log)
+        .map_err(|e| format!("[✗] Pull DefaultMasterData: {e}"))?;
+
     let remote_index = format!("{}/Sharin.Resources/Default/index", REMOTE_BASE);
     let index_parent = cache_base.join("Sharin.Resources/Default");
-    if let Err(e) = pull_directory(serial, &remote_index, &index_parent) {
-        let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(
-            format!("[!] Pull index: {e}"),
-        )));
-    }
+    pull_directory(serial, &remote_index, &index_parent, &log)
+        .map_err(|e| format!("[✗] Pull index: {e}"))?;
+
+    Ok(())
 }
 
 /// Scans blob stems from the local Default cache.
