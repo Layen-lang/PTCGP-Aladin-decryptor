@@ -94,17 +94,32 @@ pub fn relative_remote_path(remote_path: &str) -> &str {
         .trim_start_matches('/')
 }
 
+const SDCARD_TMP: &str = "/sdcard/ptcgp_tmp";
+
 /// Recursively pulls a remote directory.
+/// Copies to /sdcard first to bypass Android 11+ restrictions on /Android/data/.
 pub fn pull_directory(serial: &str, remote_path: &str, local_dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(local_dest)
         .map_err(|e| format!("mkdir {}: {e}", local_dest.display()))?;
+
+    // 1. Copy to sdcard
+    shell_cmd(serial, &["mkdir", "-p", SDCARD_TMP])?;
+    shell_cmd(serial, &["cp", "-r", remote_path, SDCARD_TMP])?;
+
+    // 2. Pull from sdcard
+    let dirname = remote_path.rsplit('/').next().unwrap_or("files");
+    let tmp_path = format!("{SDCARD_TMP}/{dirname}");
     let dest_str = local_dest
         .to_str()
         .ok_or_else(|| format!("non-UTF8 path: {}", local_dest.display()))?;
     let status = Command::new("adb")
-        .args(["-s", serial, "pull", remote_path, dest_str])
+        .args(["-s", serial, "pull", &tmp_path, dest_str])
         .status()
         .map_err(|e| format!("adb pull: {e}"))?;
+
+    // 3. Cleanup
+    let _ = shell_cmd(serial, &["rm", "-rf", SDCARD_TMP]);
+
     if status.success() {
         Ok(())
     } else {
@@ -142,20 +157,46 @@ pub fn list_remote_blob_stems(serial: &str) -> Result<Vec<String>, String> {
 }
 
 /// Pulls a single remote file to a local path (creates parent directories).
+/// Copies to /sdcard first to bypass Android 11+ restrictions on /Android/data/.
 pub fn pull_file(serial: &str, remote_path: &str, local_dest: &Path) -> Result<(), String> {
     if let Some(parent) = local_dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
+    let filename = remote_path.rsplit('/').next().unwrap_or("file");
+    let tmp_path = format!("{SDCARD_TMP}/{filename}");
+
+    // 1. Copy to sdcard
+    shell_cmd(serial, &["mkdir", "-p", SDCARD_TMP])?;
+    shell_cmd(serial, &["cp", remote_path, &tmp_path])?;
+
+    // 2. Pull from sdcard
+    let dest_str = local_dest
+        .to_str()
+        .ok_or_else(|| format!("non-UTF8 path: {}", local_dest.display()))?;
     let status = Command::new("adb")
-        .args(["-s", serial, "pull", remote_path,
-               local_dest.to_str().ok_or_else(|| format!("non-UTF8 path: {}", local_dest.display()))?])
+        .args(["-s", serial, "pull", &tmp_path, dest_str])
         .status()
         .map_err(|e| format!("adb pull: {e}"))?;
+
+    // 3. Cleanup
+    let _ = shell_cmd(serial, &["rm", "-f", &tmp_path]);
 
     if status.success() {
         Ok(())
     } else {
         Err(format!("adb pull failed for {remote_path}"))
+    }
+}
+
+fn shell_cmd(serial: &str, args: &[&str]) -> Result<(), String> {
+    let mut cmd = Command::new("adb");
+    cmd.args(["-s", serial, "shell"]);
+    cmd.args(args);
+    let status = cmd.status().map_err(|e| format!("adb shell: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("adb shell {} failed", args.join(" ")))
     }
 }
