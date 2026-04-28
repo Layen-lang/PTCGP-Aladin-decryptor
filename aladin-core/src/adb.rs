@@ -116,10 +116,11 @@ pub fn pull_directory(
     })
 }
 
-/// Lists the stems of Default blobs on the device (without downloading).
+/// Lists the stems of blobs in `<REMOTE_BASE>/<blob_subpath>` on the device.
+/// `blob_subpath` is for example `"Sharin.Resources/Default/blob"`.
 /// Returns hex stems (filenames without `.aladin`).
-pub fn list_remote_blob_stems(serial: &str) -> Result<Vec<String>, String> {
-    let blob_path = format!("{}/Sharin.Resources/Default/blob", REMOTE_BASE);
+pub fn list_remote_blob_stems(serial: &str, blob_subpath: &str) -> Result<Vec<String>, String> {
+    let blob_path = format!("{}/{}", REMOTE_BASE, blob_subpath);
     let output = Command::new("adb")
         .args([
             "-s", serial,

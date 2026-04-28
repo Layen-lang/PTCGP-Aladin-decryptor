@@ -1,7 +1,7 @@
 // aladin-app/src/worker.rs
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -9,7 +9,7 @@ use std::{
 
 use aladin_core::{
     adb::{list_remote_blob_stems, pull_directory, pull_file, REMOTE_BASE},
-    pipeline::{run_pipeline, PipelineEvent},
+    pipeline::{run_pipeline, PipelineEvent, NAMESPACES},
     state::ProcessingState,
 };
 
@@ -17,7 +17,7 @@ use aladin_core::{
 pub enum WorkerMsg {
     /// ADB pull progress.
     /// - Bulk (first run): current = percentage 0–100, total = 100
-    /// - Incremental:      current = files downloaded, total = new file count
+    /// - Incremental:      current = files downloaded, total = new file count (cross-namespace)
     PullProgress { current: usize, total: usize },
     PipelineEvent(PipelineEvent),
 }
@@ -54,9 +54,10 @@ fn worker_thread(
 
     if action == WorkerAction::PullOnly || action == WorkerAction::Full {
         // ── 1. Pull ────────────────────────────────────────────────────────────────
-        let blob_dir = cache_base.join("Sharin.Resources/Default/blob");
-        let has_cache = blob_dir.exists()
-            && std::fs::read_dir(&blob_dir)
+        // "has_cache" is keyed on Default/blob: if absent we treat it as a first run.
+        let default_blob_dir = cache_base.join("Sharin.Resources/Default/blob");
+        let has_cache = default_blob_dir.exists()
+            && std::fs::read_dir(&default_blob_dir)
                 .map(|mut d| d.next().is_some())
                 .unwrap_or(false);
 
@@ -66,7 +67,7 @@ fn worker_thread(
                 "[→] Local cache found — checking for new files…".into(),
             )));
 
-            // Always re-pull DefaultMasterData and index (small, may change each update)
+            // Always re-pull DefaultMasterData and indexes (small, may change each update)
             if let Err(e) = refresh_support_dirs(&serial, &cache_base, &tx) {
                 let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(e)));
                 let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Done {
@@ -76,52 +77,64 @@ fn worker_thread(
                 return;
             }
 
-            // New blobs
-            let remote_stems = match list_remote_blob_stems(&serial) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(
-                        format!("[✗] ADB list: {e}"),
-                    )));
-                    let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Done {
-                        decrypted: 0,
-                        errors: 1,
-                    }));
-                    return;
-                }
-            };
+            // Per-namespace incremental blob pull
+            let mut to_pull_per_ns: Vec<(&'static str, &'static str, Vec<String>)> = Vec::new();
+            for ns in NAMESPACES {
+                let remote_stems = match list_remote_blob_stems(&serial, ns.blob_dir_rel) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(
+                            format!("[✗] ADB list {}: {e}", ns.name),
+                        )));
+                        let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Done {
+                            decrypted: 0,
+                            errors: 1,
+                        }));
+                        return;
+                    }
+                };
 
-            let cached: HashSet<String> = scan_local_blob_stems(&cache_base).into_iter().collect();
-            let to_pull: Vec<String> = remote_stems
-                .into_iter()
-                .filter(|s| !cached.contains(s))
-                .collect();
+                let cached: HashSet<String> = scan_local_blob_stems(&cache_base, ns.blob_dir_rel)
+                    .into_iter()
+                    .collect();
+                let to_pull: Vec<String> = remote_stems
+                    .into_iter()
+                    .filter(|s| !cached.contains(s))
+                    .collect();
 
-            let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Log(format!(
-                "[→] {} new blobs to download",
-                to_pull.len()
-            ))));
+                let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Log(format!(
+                    "[→] {} — {} new blobs to download",
+                    ns.name,
+                    to_pull.len()
+                ))));
 
-            if !to_pull.is_empty() {
-                let total = to_pull.len();
+                to_pull_per_ns.push((ns.name, ns.blob_dir_rel, to_pull));
+            }
+
+            let total: usize = to_pull_per_ns.iter().map(|(_, _, v)| v.len()).sum();
+            if total > 0 {
                 let _ = tx.send(WorkerMsg::PullProgress { current: 0, total });
 
-                for (i, stem) in to_pull.iter().enumerate() {
-                    let prefix = if stem.len() >= 2 { &stem[..2] } else { stem.as_str() };
-                    let remote = format!(
-                        "{}/Sharin.Resources/Default/blob/{}/{}.aladin",
-                        REMOTE_BASE, prefix, stem
-                    );
-                    let local = cache_base.join(format!(
-                        "Sharin.Resources/Default/blob/{}/{}.aladin",
-                        prefix, stem
-                    ));
-                    if let Err(e) = pull_file(&serial, &remote, &local, &|_| {}) {
-                        let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(
-                            format!("[!] Pull {stem}: {e}"),
-                        )));
+                let mut pulled = 0usize;
+                for (_ns_name, blob_dir_rel, stems) in &to_pull_per_ns {
+                    for stem in stems {
+                        let prefix = if stem.len() >= 2 { &stem[..2] } else { stem.as_str() };
+                        let remote = format!(
+                            "{}/{}/{}/{}.aladin",
+                            REMOTE_BASE, blob_dir_rel, prefix, stem
+                        );
+                        let local = cache_base.join(format!(
+                            "{}/{}/{}.aladin",
+                            blob_dir_rel, prefix, stem
+                        ));
+                        if let Err(e) = pull_file(&serial, &remote, &local, &|_| {}) {
+                            let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Error(
+                                format!("[!] Pull {stem}: {e}"),
+                            )));
+                        }
+                        pulled += 1;
+                        let _ = tx.send(WorkerMsg::PullProgress { current: pulled, total });
                     }
-                    let _ = tx.send(WorkerMsg::PullProgress { current: i + 1, total });
                 }
             }
         } else {
@@ -130,9 +143,15 @@ fn worker_thread(
                 "[→] First full pull of the directory…".into(),
             )));
 
-            // 1. Get total expected count
-            let remote_stems = list_remote_blob_stems(&serial).unwrap_or_default();
-            let total = remote_stems.len();
+            // 1. Get total expected count across all namespaces
+            let total: usize = NAMESPACES
+                .iter()
+                .map(|ns| {
+                    list_remote_blob_stems(&serial, ns.blob_dir_rel)
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                })
+                .sum();
             let _ = tx.send(WorkerMsg::PullProgress { current: 0, total });
 
             // 2. Start pull in a separate thread
@@ -165,8 +184,11 @@ fn worker_thread(
                         break;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        // Count local files
-                        let current = scan_local_blob_stems(&cache_base).len();
+                        // Count local files across all namespaces
+                        let current: usize = NAMESPACES
+                            .iter()
+                            .map(|ns| scan_local_blob_stems(&cache_base, ns.blob_dir_rel).len())
+                            .sum();
                         let _ = tx.send(WorkerMsg::PullProgress { current, total });
                         std::thread::sleep(std::time::Duration::from_millis(500));
                     }
@@ -181,17 +203,21 @@ fn worker_thread(
     }
 
     if action == WorkerAction::DecryptOnly || action == WorkerAction::Full {
-        // ── 2. Filter blobs not yet decrypted ────────────────────────────────────
+        // ── 2. Build per-namespace stem lists, filtered against state.json ────────
         let state = ProcessingState::load(&output_dir);
-        let new_stems: Vec<String> = scan_local_blob_stems(&cache_base)
-            .into_iter()
-            .filter(|stem| !state.is_processed(stem))
-            .collect();
-
-        let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Log(format!(
-            "[→] {} blobs to decrypt",
-            new_stems.len()
-        ))));
+        let mut new_stems: HashMap<String, Vec<String>> = HashMap::new();
+        for ns in NAMESPACES {
+            let stems: Vec<String> = scan_local_blob_stems(&cache_base, ns.blob_dir_rel)
+                .into_iter()
+                .filter(|stem| !state.is_processed(ns.name, stem))
+                .collect();
+            let _ = tx.send(WorkerMsg::PipelineEvent(PipelineEvent::Log(format!(
+                "[→] {} — {} blobs to decrypt",
+                ns.name,
+                stems.len()
+            ))));
+            new_stems.insert(ns.name.to_string(), stems);
+        }
 
         // ── 3. Decryption pipeline ────────────────────────────────────────────────
         let (pipe_tx, pipe_rx) = std::sync::mpsc::channel();
@@ -214,7 +240,7 @@ fn worker_thread(
     }
 }
 
-/// Re-pulls DefaultMasterData and the full index from the device.
+/// Re-pulls DefaultMasterData and the index of every namespace.
 /// These directories are small and change with every game update.
 /// Returns an error string on the first failure.
 fn refresh_support_dirs(serial: &str, cache_base: &Path, tx: &Sender<WorkerMsg>) -> Result<(), String> {
@@ -226,17 +252,25 @@ fn refresh_support_dirs(serial: &str, cache_base: &Path, tx: &Sender<WorkerMsg>)
     pull_directory(serial, &remote_master, cache_base, &log)
         .map_err(|e| format!("[✗] Pull DefaultMasterData: {e}"))?;
 
-    let remote_index = format!("{}/Sharin.Resources/Default/index", REMOTE_BASE);
-    let index_parent = cache_base.join("Sharin.Resources/Default");
-    pull_directory(serial, &remote_index, &index_parent, &log)
-        .map_err(|e| format!("[✗] Pull index: {e}"))?;
+    for ns in NAMESPACES {
+        let remote_index = format!("{}/{}", REMOTE_BASE, ns.index_dir_rel);
+        // Local destination is the parent of the index dir, since adb pull copies
+        // the leaf "index" directory under it.
+        let local_parent = cache_base.join(
+            Path::new(ns.index_dir_rel)
+                .parent()
+                .unwrap_or(Path::new("")),
+        );
+        pull_directory(serial, &remote_index, &local_parent, &log)
+            .map_err(|e| format!("[✗] Pull {} index: {e}", ns.name))?;
+    }
 
     Ok(())
 }
 
-/// Scans blob stems from the local Default cache.
-fn scan_local_blob_stems(cache_base: &Path) -> Vec<String> {
-    let blob_dir = cache_base.join("Sharin.Resources/Default/blob");
+/// Scans blob stems from a local namespace blob directory.
+fn scan_local_blob_stems(cache_base: &Path, blob_dir_rel: &str) -> Vec<String> {
+    let blob_dir = cache_base.join(blob_dir_rel);
     let mut stems = Vec::new();
     let Ok(subdirs) = std::fs::read_dir(&blob_dir) else { return stems };
     for subdir in subdirs.flatten() {
