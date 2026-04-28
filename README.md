@@ -41,15 +41,20 @@ The binary is produced at `target/release/aladin-app`.
 6. **Pull** — fetches the encrypted files from the device (only new files on subsequent runs)
 7. **Decrypt** — decrypts all pulled blobs and writes plaintext files to your output directory
 
-Decrypted files are written to `<output_dir>/decrypted/Sharin.Resources/Default/blob/`. The tool keeps a `state.json` to track already-processed files and skip them on future runs.
+Decrypted files are written to `<output_dir>/decrypted/Sharin.Resources/<namespace>/blob/`, where `<namespace>` is either `Default` or `aladin`. The tool keeps a `state.json` to track already-processed files (per namespace) and skip them on future runs.
 
 ---
 
 ## Using the decrypted files
 
-The decrypted blobs are **Unity asset bundles** (UnityFS format). They contain the actual game assets: textures, sprites, audio clips, serialized data, etc.
+The two namespaces hold different kinds of payloads and need different tooling:
 
-### AssetStudioModCLI
+| Namespace | Content | Tooling |
+|---|---|---|
+| `Default/blob/` | Unity asset bundles (UnityFS) — textures, sprites, audio, serialized data | AssetStudio (see below) |
+| `aladin/blob/` | Master data tables (game logic, card definitions, etc.) — **not** Unity bundles | **In development** — no public extractor yet |
+
+### Default — AssetStudioModCLI
 
 Download [AssetStudio](https://github.com/Razviar/assetstudio) and use the CLI for batch export:
 
@@ -58,6 +63,10 @@ AssetStudioModCLI.exe <output_dir>/decrypted/Sharin.Resources/Default/blob -m ex
 ```
 
 The Unity version shown here was current at the time of writing — it may change with game updates. You can find the exact version by opening any decrypted blob in a hex editor and reading the null-terminated string at offset 12 (right after the `UnityFS` magic bytes and the 4-byte format version).
+
+### aladin — master data (WIP)
+
+The `aladin/` namespace decrypts to master-data files (not UnityFS). A dedicated parser is **still in development**; for now, the decrypted blobs in `decrypted/Sharin.Resources/aladin/blob/` are usable as-is for inspection (hex editor, custom scripts) but no batch-export tool is shipped yet.
 
 ---
 
