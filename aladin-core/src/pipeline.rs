@@ -14,18 +14,27 @@ use rayon::prelude::*;
 
 use crate::{
     ali2::{build_ali2_lookup, Ali2Entry},
-    crypto::{decrypt_blob, decrypt_key_file, GLOBAL_KEY},
+    crypto::{decrypt_blob, decrypt_key_file, ALADIN_KEY_BODY, GLOBAL_KEY},
     state::ProcessingState,
 };
 
-/// Master key directory (shared across namespaces).
+/// Directory holding the encrypted Default master key (DefaultMasterData/blob/<xx>/<keyIdHash>.aladin).
 const KEY_DIR_REL: &str = "DefaultMasterData/blob";
+
+/// How a namespace obtains its 32-byte ChaCha20 key body.
+pub enum KeySource {
+    /// Decrypt `DefaultMasterData/blob/<xx>/<keyIdHash>.aladin` with the global key.
+    DefaultMaster,
+    /// Static key embedded in libil2cpp.so (no derivation, no disk file).
+    Hardcoded(&'static [u8; 32]),
+}
 
 /// Logical groups of blob/index that share the same master key.
 pub struct Namespace {
     pub name: &'static str,
     pub blob_dir_rel: &'static str,
     pub index_dir_rel: &'static str,
+    pub key: KeySource,
 }
 
 pub const NAMESPACES: &[Namespace] = &[
@@ -33,11 +42,13 @@ pub const NAMESPACES: &[Namespace] = &[
         name: "Default",
         blob_dir_rel:  "Sharin.Resources/Default/blob",
         index_dir_rel: "Sharin.Resources/Default/index",
+        key: KeySource::DefaultMaster,
     },
     Namespace {
         name: "aladin",
         blob_dir_rel:  "Sharin.Resources/aladin/blob",
         index_dir_rel: "Sharin.Resources/aladin/index",
+        key: KeySource::Hardcoded(&ALADIN_KEY_BODY),
     },
 ];
 
@@ -62,32 +73,29 @@ pub fn run_pipeline(
     new_stems: &HashMap<String, Vec<String>>,
     tx: EventSender,
 ) {
-    // ── 1. Discover + decrypt the main key ────────────────────────────────────
-    let (key_path, key_id_hash) = match find_key_blob(pull_dir) {
-        Ok(k) => {
-            let _ = tx.send(PipelineEvent::Log(format!(
-                "[→] Key found: {:016x}",
-                k.1
-            )));
-            k
-        }
-        Err(e) => {
-            let _ = tx.send(PipelineEvent::Error(format!("[✗] Main key: {e}")));
-            let _ = tx.send(PipelineEvent::Done { decrypted: 0, errors: 1 });
-            return;
-        }
-    };
+    // ── 1. Lazily derive the Default master key (only if some namespace needs it) ────
+    let needs_default = NAMESPACES.iter().any(|ns| {
+        matches!(ns.key, KeySource::DefaultMaster)
+            && new_stems.get(ns.name).map(|v| !v.is_empty()).unwrap_or(false)
+    });
 
-    let kb = match decrypt_main_key(&key_path, key_id_hash) {
-        Ok(k) => {
-            let _ = tx.send(PipelineEvent::Log("[✓] Main key decrypted".into()));
-            k
+    let default_kb: Option<[u8; 32]> = if needs_default {
+        match find_key_blob(pull_dir).and_then(|(p, id)| {
+            let _ = tx.send(PipelineEvent::Log(format!("[→] Key found: {:016x}", id)));
+            decrypt_main_key(&p, id)
+        }) {
+            Ok(k) => {
+                let _ = tx.send(PipelineEvent::Log("[✓] Main key decrypted".into()));
+                Some(k)
+            }
+            Err(e) => {
+                let _ = tx.send(PipelineEvent::Error(format!("[✗] Main key: {e}")));
+                let _ = tx.send(PipelineEvent::Done { decrypted: 0, errors: 1 });
+                return;
+            }
         }
-        Err(e) => {
-            let _ = tx.send(PipelineEvent::Error(format!("[✗] Main key: {e}")));
-            let _ = tx.send(PipelineEvent::Done { decrypted: 0, errors: 1 });
-            return;
-        }
+    } else {
+        None
     };
 
     // ── 2. Setup shared state and global counters ─────────────────────────────
@@ -119,6 +127,26 @@ pub fn run_pipeline(
             }
         };
 
+        let kb = match &ns.key {
+            KeySource::DefaultMaster => match default_kb.as_ref() {
+                Some(k) => k,
+                None => {
+                    let _ = tx.send(PipelineEvent::Error(format!(
+                        "[!] {} — Default master key unavailable, skipping",
+                        ns.name
+                    )));
+                    continue;
+                }
+            },
+            KeySource::Hardcoded(k) => {
+                let _ = tx.send(PipelineEvent::Log(format!(
+                    "[✓] {} — using embedded key",
+                    ns.name
+                )));
+                *k
+            }
+        };
+
         let index_files = find_all_index_files(pull_dir, ns.index_dir_rel);
         if index_files.is_empty() {
             let _ = tx.send(PipelineEvent::Error(format!(
@@ -134,7 +162,7 @@ pub fn run_pipeline(
             index_files.len()
         )));
 
-        let lookup = load_merged_ali2(&index_files, &kb, ns.name, &tx);
+        let lookup = load_merged_ali2(&index_files, kb, ns.name, &tx);
 
         let _ = tx.send(PipelineEvent::Log(format!(
             "[✓] {} — merged index, {} entries",
@@ -159,7 +187,7 @@ pub fn run_pipeline(
             let blob_rel  = format!("{}/{}/{}.aladin", ns.blob_dir_rel, prefix, stem);
             let blob_path = pull_dir.join(&blob_rel);
 
-            match decrypt_one_blob(&blob_path, stem, &kb, &lookup) {
+            match decrypt_one_blob(&blob_path, stem, kb, &lookup) {
                 Ok(plaintext) => {
                     let out_path = decrypt_dir.join(&blob_rel);
                     match write_decrypted(&out_path, &plaintext) {
