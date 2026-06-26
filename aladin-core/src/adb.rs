@@ -76,6 +76,25 @@ pub fn list_remote_aladin_files(serial: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Returns the remote paths of all APKs for a given package.
+pub fn get_package_apk_paths(serial: &str, package: &str) -> Result<Vec<String>, String> {
+    let output = Command::new("adb")
+        .args(["-s", serial, "shell", "pm", "path", package])
+        .output()
+        .map_err(|e| format!("adb shell pm path: {e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("package:").map(|p| p.trim().to_string())
+        })
+        .collect())
+}
+
 /// Extracts the stem (name without extension) from a remote path.
 /// E.g.: ".../blob/0d/0da9778d9b6bed0a.aladin" → "0da9778d9b6bed0a"
 pub fn remote_path_to_stem(remote_path: &str) -> &str {

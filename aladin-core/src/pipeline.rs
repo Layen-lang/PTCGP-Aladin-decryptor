@@ -27,6 +27,8 @@ pub enum KeySource {
     DefaultMaster,
     /// Static key embedded in libil2cpp.so (no derivation, no disk file).
     Hardcoded(&'static [u8; 32]),
+    /// File is already plain text, no decryption needed.
+    Plain,
 }
 
 /// Logical groups of blob/index that share the same master key.
@@ -35,20 +37,37 @@ pub struct Namespace {
     pub blob_dir_rel: &'static str,
     pub index_dir_rel: &'static str,
     pub key: KeySource,
+    pub is_flat: bool,
 }
 
 pub const NAMESPACES: &[Namespace] = &[
     Namespace {
         name: "Default",
-        blob_dir_rel:  "Sharin.Resources/Default/blob",
-        index_dir_rel: "Sharin.Resources/Default/index",
+        blob_dir_rel:  "Default/blob",
+        index_dir_rel: "Default/index",
         key: KeySource::DefaultMaster,
+        is_flat: false,
     },
     Namespace {
         name: "aladin",
-        blob_dir_rel:  "Sharin.Resources/aladin/blob",
-        index_dir_rel: "Sharin.Resources/aladin/index",
+        blob_dir_rel:  "aladin/blob",
+        index_dir_rel: "aladin/index",
         key: KeySource::Hardcoded(&ALADIN_KEY_BODY),
+        is_flat: false,
+    },
+    Namespace {
+        name: "AssetPack",
+        blob_dir_rel:  "AssetPack/blob",
+        index_dir_rel: "AssetPack/index",
+        key: KeySource::DefaultMaster,
+        is_flat: false,
+    },
+    Namespace {
+        name: "Data",
+        blob_dir_rel:  "Data",
+        index_dir_rel: "", // No index for Data
+        key: KeySource::Plain,
+        is_flat: true,
     },
 ];
 
@@ -127,9 +146,9 @@ pub fn run_pipeline(
             }
         };
 
-        let kb = match &ns.key {
+        let kb: [u8; 32] = match &ns.key {
             KeySource::DefaultMaster => match default_kb.as_ref() {
-                Some(k) => k,
+                Some(k) => *k,
                 None => {
                     let _ = tx.send(PipelineEvent::Error(format!(
                         "[!] {} — Default master key unavailable, skipping",
@@ -143,12 +162,24 @@ pub fn run_pipeline(
                     "[✓] {} — using embedded key",
                     ns.name
                 )));
-                *k
+                **k
+            }
+            KeySource::Plain => {
+                let _ = tx.send(PipelineEvent::Log(format!(
+                    "[·] {} — already decrypted",
+                    ns.name
+                )));
+                [0u8; 32] // Unused for Plain
             }
         };
 
-        let index_files = find_all_index_files(pull_dir, ns.index_dir_rel);
-        if index_files.is_empty() {
+        let index_files = if ns.index_dir_rel.is_empty() {
+            Vec::new()
+        } else {
+            find_all_index_files(pull_dir, ns.index_dir_rel)
+        };
+
+        if index_files.is_empty() && !ns.index_dir_rel.is_empty() {
             let _ = tx.send(PipelineEvent::Error(format!(
                 "[!] {} — no index file found, skipping",
                 ns.name
@@ -162,15 +193,15 @@ pub fn run_pipeline(
             index_files.len()
         )));
 
-        let lookup = load_merged_ali2(&index_files, kb, ns.name, &tx);
+        let lookup = if ns.index_dir_rel.is_empty() {
+            // For Data, we might not have a lookup, but decrypt_one_blob needs one
+            // unless we refactor it. For now, let's keep it empty and handle it there.
+            HashMap::new()
+        } else {
+            load_merged_ali2(&index_files, &kb, ns.name, &tx)
+        };
 
-        let _ = tx.send(PipelineEvent::Log(format!(
-            "[✓] {} — merged index, {} entries",
-            ns.name,
-            lookup.len()
-        )));
-
-        if lookup.is_empty() {
+        if lookup.is_empty() && !ns.index_dir_rel.is_empty() {
             let _ = tx.send(PipelineEvent::Error(format!(
                 "[!] {} — empty index after merge, skipping",
                 ns.name
@@ -183,15 +214,33 @@ pub fn run_pipeline(
 
         let tx_par = tx.clone();
         stems.par_iter().for_each_with(tx_par, |tx, stem| {
-            let prefix = if stem.len() >= 2 { &stem[..2] } else { stem.as_str() };
-            let blob_rel  = format!("{}/{}/{}.aladin", ns.blob_dir_rel, prefix, stem);
+            let blob_rel = if ns.is_flat {
+                format!("{}/{}", ns.blob_dir_rel, stem)
+            } else {
+                let prefix = if stem.len() >= 2 { &stem[..2] } else { stem.as_str() };
+                format!("{}/{}/{}.aladin", ns.blob_dir_rel, prefix, stem)
+            };
             let blob_path = pull_dir.join(&blob_rel);
 
-            match decrypt_one_blob(&blob_path, stem, kb, &lookup) {
-                Ok(plaintext) => {
+            match decrypt_one_blob(&blob_path, stem, &ns.key, &kb, &lookup) {
+                Ok((plaintext, is_plain, sig_name)) => {
                     let out_path = decrypt_dir.join(&blob_rel);
                     match write_decrypted(&out_path, &plaintext) {
                         Ok(()) => {
+                            if is_plain {
+                                let _ = tx.send(PipelineEvent::Log(format!(
+                                    "[·] {}/{stem}: keyIdHash is 0, treated as plain text",
+                                    ns.name
+                                )));
+                            }
+                            if sig_name.is_none() && ns.name != "aladin" && ns.name != "Data" {
+                                *errors.lock().unwrap() += 1;
+                                let _ = tx.send(PipelineEvent::Error(format!(
+                                    "[!] {}/{stem}: not a recognized Unity file (unknown signature)",
+                                    ns.name
+                                )));
+                            }
+
                             state.lock().unwrap().mark_processed(ns.name, stem);
                             let current = {
                                 let mut d = decrypted.lock().unwrap();
@@ -279,8 +328,11 @@ fn decrypt_main_key(path: &std::path::Path, key_id_hash: u64) -> Result<[u8; 32]
 
 /// Returns all `*.aladin` files in `<index_dir_rel>/*/<hash>.aladin`.
 fn find_all_index_files(pull_dir: &Path, index_dir_rel: &str) -> Vec<(std::path::PathBuf, u64)> {
-    let index_dir = pull_dir.join(index_dir_rel);
     let mut result = Vec::new();
+    if index_dir_rel.is_empty() {
+        return result;
+    }
+    let index_dir = pull_dir.join(index_dir_rel);
     let Ok(subdirs) = std::fs::read_dir(&index_dir) else { return result };
     for subdir in subdirs.flatten() {
         if !subdir.path().is_dir() { continue; }
@@ -354,9 +406,18 @@ fn load_merged_ali2(
 fn decrypt_one_blob(
     blob_path: &Path,
     stem: &str,
+    kb_source: &KeySource,
     key_body: &[u8; 32],
     lookup: &HashMap<u64, Ali2Entry>,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, bool, Option<&'static str>), String> {
+    let ciphertext = std::fs::read(blob_path)
+        .map_err(|e| format!("read {}: {e}", blob_path.display()))?;
+
+    if matches!(kb_source, KeySource::Plain) {
+        let sig_name = get_unity_signature(&ciphertext);
+        return Ok((ciphertext, true, sig_name));
+    }
+
     let ck_hash = u64::from_str_radix(stem, 16)
         .map_err(|_| format!("invalid stem: {stem}"))?;
 
@@ -364,10 +425,36 @@ fn decrypt_one_blob(
         .get(&ck_hash)
         .ok_or_else(|| "entry not found in index".to_string())?;
 
-    let ciphertext = std::fs::read(blob_path)
-        .map_err(|e| format!("read {}: {e}", blob_path.display()))?;
+    let is_plain = entry.key_id_hash == 0;
+    let plaintext = if is_plain {
+        ciphertext
+    } else {
+        decrypt_blob(&ciphertext, key_body, entry.content_hash)
+    };
 
-    Ok(decrypt_blob(&ciphertext, key_body, entry.content_hash))
+    let sig_name = get_unity_signature(&plaintext);
+
+    Ok((plaintext, is_plain, sig_name))
+}
+
+const UNITY_SIGNATURES: &[(&[u8], &'static str)] = &[
+    (b"UnityFS",                  "Unity AssetBundle (UnityFS)"),
+    (b"AFS2",                     "Unity Audio (CRI AFS2/ACB)"),
+    (b"@UTF",                     "Unity Audio (CRI UTF Table/AWB)"),
+    (b"CRID",                     "Unity Video (CRI USM)"),
+    (b"\x18\x00\x00\x00ABDL",     "Unity AssetBundle (ABDL legacy)"),
+    (b"\x1c\x00\x00\x00ABDL",     "Unity AssetBundle (ABDL legacy)"),
+    (b"\x14\x00\x00\x00ORTM",     "Unity AssetBundle (ORTM/LZMA legacy)"),
+    (b"\x18\x00\x00\x00ORTM",     "Unity AssetBundle (ORTM/LZMA legacy)"),
+];
+
+fn get_unity_signature(data: &[u8]) -> Option<&'static str> {
+    for (sig, name) in UNITY_SIGNATURES {
+        if data.starts_with(sig) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn write_decrypted(path: &Path, data: &[u8]) -> std::io::Result<()> {
